@@ -4,9 +4,11 @@ import requests
 import shodan
 import argparse
 import sys
+import time
 from bs4 import BeautifulSoup, Comment
 from urllib.parse import urljoin
 from colorama import init, Fore
+from linkfinder import analyze_js
 
 # Initialize colorama for colored output
 init()
@@ -26,7 +28,16 @@ LOGO = '''
 class TayseerScanner:
     def __init__(self, target_url, shodan_api_key=None):
         self.target_url = target_url.rstrip('/')
-        self.shodan_api = shodan.Shodan(shodan_api_key) if shodan_api_key else None
+        default_key = "cSQ4hGoR819UH3JebfAiO9E3vSunI7pG"
+        self.shodan_api_key = shodan_api_key or default_key
+        print(f"\n{Fore.CYAN}[+] Using Shodan API key: {self.shodan_api_key}{Fore.RESET}")
+        self.shodan_api = shodan.Shodan(self.shodan_api_key)
+        try:
+            self.shodan_api.info()
+            print(f"{Fore.GREEN}[+] Shodan API key is valid{Fore.RESET}")
+        except shodan.APIError as e:
+            print(f"{Fore.RED}[-] Invalid Shodan API key: {str(e)}{Fore.RESET}")
+            self.shodan_api = None
         self.visited_urls = set()
         self.hidden_pages = set()
         self.external_links = set()
@@ -45,10 +56,12 @@ class TayseerScanner:
         ]
 
     def crawl_site(self):
-        print(f"{Fore.GREEN}[+] Starting crawl on {self.target_url}{Fore.RESET}")
+        print(f"{Fore.GREEN}[+] Starting scan on {self.target_url}{Fore.RESET}")
+        print(f"{Fore.CYAN}[*] Crawling website...{Fore.RESET}")
         self._crawl_recursive(self.target_url)
         
         # Print summary after crawling
+        print(f"{Fore.GREEN}[+] Scan completed{Fore.RESET}")
         self._print_summary()
 
     def _crawl_recursive(self, url):
@@ -125,7 +138,21 @@ class TayseerScanner:
             print(f"\n{Fore.BLUE}[+] Found {len(scripts)} JavaScript files in {url}:{Fore.RESET}")
             for script in scripts:
                 src = script.get('src')
+                full_src = urljoin(url, src)
                 print(f"  {Fore.CYAN}└─ {src}{Fore.RESET}")
+                
+                # Analyze JavaScript file using linkfinder
+                try:
+                    endpoints = analyze_js(full_src)
+                    if endpoints:
+                        print(f"  {Fore.YELLOW}└─ Found {len(endpoints)} endpoints in {src}:{Fore.RESET}")
+                        for endpoint in endpoints:
+                            print(f"    {Fore.YELLOW}└─ {endpoint}{Fore.RESET}")
+                            # Add API endpoints to the set
+                            if any(pattern in endpoint.lower() for pattern in self.api_patterns):
+                                self.api_endpoints.add(endpoint)
+                except Exception as e:
+                    print(f"  {Fore.RED}└─ Error analyzing {src}: {str(e)}{Fore.RESET}")
 
     def _print_summary(self):
         print(f"\n{Fore.GREEN}{'='*50}{Fore.RESET}")
@@ -156,36 +183,83 @@ class TayseerScanner:
 
     def shodan_scan(self):
         if not self.shodan_api:
-            print(f"\n{Fore.RED}[-] Shodan API key not provided{Fore.RESET}")
+            print(f"\n{Fore.YELLOW}[!] Shodan scanning skipped - API key not provided or invalid{Fore.RESET}")
+            print(f"{Fore.YELLOW}[!] Get a valid API key from https://account.shodan.io{Fore.RESET}")
             return
 
         try:
+            print(f"\n{Fore.CYAN}[*] Resolving target hostname...{Fore.RESET}")
             import socket
             ip = socket.gethostbyname(self.target_url.replace('https://', '').replace('http://', '').split('/')[0])
-            results = self.shodan_api.host(ip)
-            print(f"{Fore.GREEN}[+] Shodan Results for {self.target_url}:{Fore.RESET}")
-            print(f"IP: {ip}")
-            print(f"OS: {results.get('os', 'Unknown')}")
-            print(f"Organization: {results.get('org', 'Unknown')}")
-            print(f"Open Ports: {', '.join(map(str, results.get('ports', [])))}")
-            print(f"Location: {results.get('city', 'Unknown')}, {results.get('country_name', 'Unknown')}")
-            print(f"Last Update: {results.get('last_update', 'Unknown')}")
             
-            # Display vulnerabilities if any
-            vulns = results.get('vulns', [])
-            if vulns:
-                print(f"\n{Fore.RED}[!] Found Vulnerabilities:{Fore.RESET}")
-                for vuln in vulns:
-                    print(f"- {vuln}") 
+            print(f"\n{Fore.CYAN}[*] Looking up Shodan information for {ip}...{Fore.RESET}")
+            max_retries = 1
+            retry_count = 0
+            results = None
+            
+            while retry_count <= max_retries:
+                try:
+                    results = self.shodan_api.host(ip)
+                    if not results:
+                        print(f"\n{Fore.YELLOW}[!] No Shodan data available for {ip}{Fore.RESET}")
+                        return
+                    if not isinstance(results, dict):
+                        print(f"\n{Fore.RED}[-] Invalid Shodan response format{Fore.RESET}")
+                        return
+                    break
+                except (shodan.APIError, Exception) as e:
+                    error_msg = str(e)
+                    if "Unable to parse JSON response" in error_msg:
+                        if retry_count < max_retries:
+                            print(f"\n{Fore.YELLOW}[!] Retrying Shodan lookup in 5 seconds...{Fore.RESET}")
+                            retry_count += 1
+                            time.sleep(5)
+                            continue
+                        print(f"\n{Fore.RED}[-] Failed to parse Shodan response after retries{Fore.RESET}")
+                        return
+                    elif "No information available" in error_msg:
+                        print(f"\n{Fore.YELLOW}[!] No Shodan data available for {ip}{Fore.RESET}")
+                        return
+                    elif "Invalid IP" in error_msg:
+                        print(f"\n{Fore.RED}[-] Invalid IP address: {ip}{Fore.RESET}")
+                        return
+                    else:
+                        if retry_count < max_retries:
+                            print(f"\n{Fore.YELLOW}[!] Retrying Shodan lookup in 2 seconds...{Fore.RESET}")
+                            retry_count += 1
+                            time.sleep(2)
+                            continue
+                        print(f"\n{Fore.RED}[-] Shodan API error: {error_msg}{Fore.RESET}")
+                        return
+            
+            if results:
+                print(f"\n{Fore.GREEN}[+] Shodan Results for {self.target_url}:{Fore.RESET}")
+                print(f"{Fore.CYAN}IP: {ip}{Fore.RESET}")
+                print(f"{Fore.CYAN}OS: {results.get('os', 'Unknown')}{Fore.RESET}")
+                print(f"{Fore.CYAN}Organization: {results.get('org', 'Unknown')}{Fore.RESET}")
+                print(f"{Fore.CYAN}ISP: {results.get('isp', 'Unknown')}{Fore.RESET}")
+                print(f"{Fore.CYAN}ASN: {results.get('asn', 'Unknown')}{Fore.RESET}")
+                print(f"{Fore.CYAN}Open Ports: {', '.join(map(str, results.get('ports', [])))}{Fore.RESET}")
+                print(f"{Fore.CYAN}Hostnames: {', '.join(results.get('hostnames', ['None']))}{Fore.RESET}")
+                print(f"{Fore.CYAN}Domains: {', '.join(results.get('domains', ['None']))}{Fore.RESET}")
+                print(f"{Fore.CYAN}Location: {results.get('city', 'Unknown')}, {results.get('country_name', 'Unknown')}{Fore.RESET}")
+                print(f"{Fore.CYAN}Last Update: {results.get('last_update', 'Unknown')}{Fore.RESET}")
+                
+                # Display vulnerabilities if any
+                vulns = results.get('vulns', [])
+                if vulns:
+                    print(f"\n{Fore.RED}[!] Found Vulnerabilities ({len(vulns)}):{Fore.RESET}")
+                    for vuln in vulns:
+                        print(f"  {Fore.RED}└─ {vuln}{Fore.RESET}")
 
         except Exception as e:
-            print(f"{Fore.RED}[-] Shodan scan error: {str(e)}{Fore.RESET}")
+            print(f"\n{Fore.RED}[-] Shodan scan error: {str(e)}{Fore.RESET}")
 
 def main():
     print(Fore.CYAN + LOGO + Fore.RESET)
     parser = argparse.ArgumentParser(description='Tayseer Website Scanner')
     parser.add_argument('-u', '--url', required=True, help='Target URL')
-    parser.add_argument('-k', '--shodan-key', default='IVYPa91tXBuOvKLJiRnlivqMQYEeSnLD', help='Shodan API Key')
+    parser.add_argument('-k', '--shodan-key', help='Shodan API Key (Get a valid key from https://account.shodan.io)')
     args = parser.parse_args()
 
     scanner = TayseerScanner(args.url, args.shodan_key)
